@@ -49,6 +49,17 @@ static json_t *signal_process(void *results)
     json_array_append_new(array, average_counters_to_json("Average signal to low prio thread",
                                                           average_results));
 
+    /* Measure signalling an active thread */
+    result = process_result(N_RUNS, raw_results->hi_prio_double_results, desc);
+    set.name = "Signal to low prio thread (active)";
+    json_array_append_new(array, result_set_to_json(set));
+
+    result_t average_results2[NUM_AVERAGE_EVENTS];
+    process_average_results(N_RUNS, NUM_AVERAGE_EVENTS, raw_results->hi_prio_double_average, average_results2);
+
+    json_array_append_new(array, average_counters_to_json("Average double signal to low prio thread",
+                                                           average_results2));
+
     return array;
 }
 

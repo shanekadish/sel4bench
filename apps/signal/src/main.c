@@ -59,7 +59,13 @@ void wait_fn(int argc, char **argv)
     seL4_Wait(ntfn, NULL);
 }
 
-/* this signal function expects to switch threads (ie wait_fn is higher prio) */
+/* Signaller Priority < Waiter Priority
+ * If waiter has higher priority, then then DO_REAL_WAIT() in wait_fn will
+ * always be called before DO_REAL_SIGNAL() in low_prio_signal_fn, so the
+ * notification should be in state NtfnState_Waiting before it is signalled, and
+ * transition into state NtfnState_Idle after it is signalled
+ * This signal function expects to switch threads (ie wait_fn is higher prio)
+ */
 void low_prio_signal_fn(int argc, char **argv)
 {
     assert(argc == N_LO_SIGNAL_ARGS);
@@ -81,6 +87,12 @@ void low_prio_signal_fn(int argc, char **argv)
     seL4_Wait(ntfn, NULL);
 }
 
+/* Signaller Priority > Waiter Priority
+ * If signaller has higher priority, then then DO_REAL_SIGNAL() in
+ * high_prio_signal_fn will always be called before DO_REAL_WAIT() in wait_fn,
+ * so the notification should be in state NtfnState_Idle before it is signalled,
+ * and transition into state NtfnState_Active after it is signalled
+ */
 void high_prio_signal_fn(int argc, char **argv)
 {
     assert(argc == N_HI_SIGNAL_ARGS);
@@ -119,6 +131,69 @@ void high_prio_signal_fn(int argc, char **argv)
             SEL4BENCH_READ_CCNT(end);
             sel4bench_read_and_stop_counters(mask, chunk, n_counters, results->hi_prio_average[j]);
             results->hi_prio_average[j][CYCLE_COUNT_EVENT] = end - start;
+            COMPILER_MEMORY_FENCE();
+        }
+    }
+
+    /* signal completion */
+    seL4_Send(done_ep, seL4_MessageInfo_new(0, 0, 0, 0));
+    /* block */
+    seL4_Wait(ntfn, NULL);
+}
+
+/* Signaller Priority > Waiter Priority
+ * Here we call DO_REAL_SIGNAL twice; once to transition the notification into
+ * NtfnState_Active, and again to then measure the latency of signalling an
+ * active notification
+ */
+void high_prio_double_signal_fn(int argc, char **argv)
+{
+    assert(argc == N_HI_SIGNAL_ARGS);
+    seL4_CPtr ntfn = (seL4_CPtr) atol(argv[0]);
+    signal_results_t *results = (signal_results_t *) atol(argv[1]);
+    seL4_CPtr done_ep = (seL4_CPtr) atol(argv[2]);
+
+    /* we run a benchmark where we try and read the cycle counter
+     * for individual runs - this may not yield a stable result on all platforms
+     * due to pipeline, cache etc */
+    for (int i = 0; i < N_RUNS; i++) {
+        ccnt_t start, end;
+        COMPILER_MEMORY_FENCE();
+        DO_REAL_SIGNAL(ntfn); // this should transition notification from idle to active
+        SEL4BENCH_READ_CCNT(start);
+        DO_REAL_SIGNAL(ntfn); // this should signal an active notification
+        SEL4BENCH_READ_CCNT(end);
+        COMPILER_MEMORY_FENCE();
+        /* record the result */
+        results->hi_prio_double_results[i] = (end - start);
+    }
+
+    for (int i = 0; i < N_RUNS; i++) {
+        ccnt_t start, end;
+        COMPILER_MEMORY_FENCE();
+        SEL4BENCH_READ_CCNT(start);
+        seL4_BenchmarkNullSyscall();
+        SEL4BENCH_READ_CCNT(end);
+        COMPILER_MEMORY_FENCE();
+    }
+
+    seL4_Word n_counters = sel4bench_get_num_counters();
+    ccnt_t start = 0;
+    ccnt_t end = 0;
+    assert(n_counters > 0);
+    assert(sel4bench_get_num_generic_counter_chunks(n_counters) > 0);
+    for (int j = 0; j < N_RUNS; j++) {
+        for (seL4_Word chunk = 0; chunk < sel4bench_get_num_generic_counter_chunks(n_counters); chunk++) {
+            COMPILER_MEMORY_FENCE();
+            counter_bitfield_t mask = sel4bench_enable_generic_counters(chunk, n_counters);
+            DO_REAL_SIGNAL(ntfn); // this should transition notification from idle to active
+            SEL4BENCH_READ_CCNT(start);
+            for (int i = 0; i < AVERAGE_RUNS; i++) {
+                DO_REAL_SIGNAL(ntfn);
+            }
+            SEL4BENCH_READ_CCNT(end);
+            sel4bench_read_and_stop_counters(mask, chunk, n_counters, results->hi_prio_double_average[j]);
+            results->hi_prio_double_average[j][CYCLE_COUNT_EVENT] = end - start;
             COMPILER_MEMORY_FENCE();
         }
     }
@@ -201,6 +276,20 @@ static void benchmark(env_t *env, seL4_CPtr ep, seL4_CPtr ntfn, signal_results_t
     benchmark_wait_children(ep, "children of notification", 1);
 
     stop_threads(&wait, &signal);
+
+    /* change params for high prio double signaller */
+    signal.fn = (sel4utils_thread_entry_fn) high_prio_double_signal_fn;
+    signal.argc = N_HI_SIGNAL_ARGS;
+    sel4utils_create_word_args(signal.argv_strings, signal.argv, signal.argc, ntfn,
+                               (seL4_Word) results, ep);
+
+    start_threads(&wait, &signal);
+
+    benchmark_wait_children(ep, "children of notification", 1);
+
+    stop_threads(&wait, &signal);
+
+
 }
 
 void measure_signal_overhead(seL4_CPtr ntfn, ccnt_t *results)
